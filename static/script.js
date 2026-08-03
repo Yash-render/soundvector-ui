@@ -1,4 +1,31 @@
+// =============================================================
+// BUILD VERSION — increment this on every deploy.
+// Changing this value forces all users to reload fresh assets
+// and clears any stale localStorage state from the old build.
+// =============================================================
+const BUILD_VERSION = '2.0';
+
+(function _clearStaleBuildCache() {
+    const STORE_KEY = 'soundvector_build_version';
+    const stored = localStorage.getItem(STORE_KEY);
+    if (stored !== BUILD_VERSION) {
+        // New build detected — wipe all SoundVector cache keys EXCEPT the user login
+        const savedUser = localStorage.getItem('soundvector_user');
+        // Clear everything in localStorage that belongs to SoundVector
+        Object.keys(localStorage).forEach(k => {
+            if (k.startsWith('soundvector_')) localStorage.removeItem(k);
+        });
+        // Re-persist login so user isn't logged out on upgrade
+        if (savedUser) localStorage.setItem('soundvector_user', savedUser);
+        // Mark the new version so we don't clear again until next deploy
+        localStorage.setItem(STORE_KEY, BUILD_VERSION);
+        // Also clear sessionStorage entirely for a clean slate
+        sessionStorage.clear();
+    }
+})();
+
 let API_BASE = "";
+
 
 let currentMode = 'similar';
 let currentSearchType = 'track';
@@ -670,7 +697,7 @@ function renderHomeSection(section) {
                 </div>
                 <div class="listen-on-row" id="enrich-hs-${t.row}" data-track-key="${escapeAttr(getTrackKey(t.name, t.artist))}"></div>
             </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-hs-${t.row}`, t.row, t), idx * 60);
+        queueTrackEnrichment(t.name, t.artist, t.row, t);
     });
 
     html += `</div></div>`;
@@ -862,7 +889,7 @@ function renderMainData(data) {
             </div>
         </div>`;
         // Lazy-load enrichment for each rec card
-        setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row, r), idx * 80);
+        queueTrackEnrichment(r.name, r.artist, r.row, r);
     });
     html += `</div>`;
     
@@ -927,7 +954,7 @@ async function loadMoreRecommendations() {
                         </div>
                     </div>
                 </div>`;
-                setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row, r), idx * 80);
+                queueTrackEnrichment(r.name, r.artist, r.row, r);
             });
             container.insertAdjacentHTML('beforeend', appendHtml);
         }
@@ -1132,8 +1159,13 @@ function openMobileTrackInsights(trackName, artistName, data, row) {
 
 // ---------------------------------------------------------
 // Track Enrichment: Deezer + iTunes Preview + YouTube Music
+// Batch system: collects enrichment needs and fires ONE /api/batch_enrich
+// instead of one /api/enrich per card (eliminates the request waterfall).
 // ---------------------------------------------------------
 const enrichCache = {};
+const _pendingEnrich = new Set(); // tracks keys currently in-flight
+let _enrichQueue = [];            // batch queue
+let _enrichFlushTimer = null;     // debounce timer for flushing
 
 function seedEnrichCache(track) {
     if (!track || !track.name || !track.artist) return;
@@ -1152,35 +1184,24 @@ function seedEnrichCache(track) {
     }
 }
 
-async function loadTrackEnrichment(trackName, artistName, containerId, row, trackObj) {
-    if (!trackName || !artistName) return;
-    if (trackObj) seedEnrichCache(trackObj);
-    const cacheKey = getTrackKey(trackName, artistName);
-    let data = enrichCache[cacheKey];
-    if (!data) {
-        try {
-            const res = await fetch(`${API_BASE}/api/enrich?track=${encodeURIComponent(trackName)}&artist=${encodeURIComponent(artistName)}`);
-            data = await res.json();
-            enrichCache[cacheKey] = data;
-        } catch (e) { return; }
-    }
-
-
-    let btns = '';
+/**
+ * Apply enrichment data to all matching DOM elements (art boxes + listen rows).
+ */
+function _applyEnrichmentToDOM(cacheKey, data, trackName, artistName, row) {
+    const btns = [];
     if (data.deezer_link) {
-        btns += `<a class="listen-btn deezer-btn" href="${data.deezer_link}" target="_blank" onclick="event.stopPropagation();" title="Open on Deezer">${SVG_ICONS.deezer} <span>Deezer</span></a>`;
+        btns.push(`<a class="listen-btn deezer-btn" href="${data.deezer_link}" target="_blank" onclick="event.stopPropagation();" title="Open on Deezer">${SVG_ICONS.deezer} <span>Deezer</span></a>`);
     }
     if (data.youtube_music_url) {
-        btns += `<a class="listen-btn yt-btn" href="${data.youtube_music_url}" target="_blank" onclick="event.stopPropagation();" title="Search on YouTube Music">${SVG_ICONS.youtube} <span>YT Music</span></a>`;
+        btns.push(`<a class="listen-btn yt-btn" href="${data.youtube_music_url}" target="_blank" onclick="event.stopPropagation();" title="Search on YouTube Music">${SVG_ICONS.youtube} <span>YT Music</span></a>`);
     }
+    const btnsHtml = btns.join('');
 
-    // Update ALL matching cover art elements in DOM with album art + play overlay
     if (data.deezer_album_art) {
         document.querySelectorAll('.enrich-art').forEach(artEl => {
             if (artEl.getAttribute('data-track-key') === cacheKey) {
                 let overlayHtml = '';
                 if (data.deezer_preview_url) {
-                    // Force HTTPS — iOS Safari blocks HTTP audio on HTTPS pages
                     const httpsUrl = data.deezer_preview_url.replace(/^http:\/\//i, 'https://');
                     const safeUrl = httpsUrl.replace(/"/g, '&quot;');
                     const safeName = (trackName || '').replace(/"/g, '&quot;');
@@ -1193,17 +1214,105 @@ async function loadTrackEnrichment(trackName, artistName, containerId, row, trac
         });
     }
 
-    // Update ALL matching listen rows in DOM
     document.querySelectorAll('.listen-on-row').forEach(listenEl => {
         if (listenEl.getAttribute('data-track-key') === cacheKey) {
-            if (btns) {
-                listenEl.innerHTML = btns;
+            if (btnsHtml) {
+                listenEl.innerHTML = btnsHtml;
                 listenEl.style.display = 'flex';
             } else {
                 listenEl.style.display = 'none';
             }
         }
     });
+}
+
+/**
+ * Flush the enrichment queue: fire ONE /api/batch_enrich for all queued tracks.
+ * This replaces the old per-card setTimeout + /api/enrich waterfall.
+ */
+async function _flushEnrichQueue() {
+    if (_enrichQueue.length === 0) return;
+    const batch = _enrichQueue.splice(0, _enrichQueue.length); // drain queue atomically
+
+    // Filter to only tracks not already cached or in-flight
+    const toFetch = [];
+    const localData = [];
+    for (const item of batch) {
+        const key = getTrackKey(item.name, item.artist);
+        if (enrichCache[key]) {
+            localData.push({ ...item, _cached: enrichCache[key] });
+        } else if (!_pendingEnrich.has(key)) {
+            _pendingEnrich.add(key);
+            toFetch.push(item);
+        }
+    }
+
+    // Apply already-cached items immediately
+    for (const item of localData) {
+        _applyEnrichmentToDOM(getTrackKey(item.name, item.artist), item._cached, item.name, item.artist, item.row);
+    }
+
+    if (toFetch.length === 0) return;
+
+    try {
+        const res = await fetch(`${API_BASE}/api/batch_enrich`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(toFetch.map(t => ({ name: t.name, artist: t.artist, row: t.row })))
+        });
+        const data = await res.json();
+        const enriched = data.tracks || [];
+        for (const track of enriched) {
+            if (!track || !track.name || !track.artist) continue;
+            const key = getTrackKey(track.name, track.artist);
+            const cached = {
+                deezer_album_art: track.deezer_album_art || '',
+                deezer_preview_url: track.deezer_preview_url || '',
+                deezer_link: track.deezer_link || '',
+                deezer_album_name: track.deezer_album_name || '',
+                youtube_music_url: track.youtube_music_url || `https://music.youtube.com/search?q=${encodeURIComponent(track.artist + ' ' + track.name)}`,
+                youtube_url: track.youtube_url || ''
+            };
+            enrichCache[key] = cached;
+            _pendingEnrich.delete(key);
+            // Find original row from our toFetch list
+            const orig = toFetch.find(t => getTrackKey(t.name, t.artist) === key);
+            _applyEnrichmentToDOM(key, cached, track.name, track.artist, orig ? orig.row : -1);
+        }
+    } catch (e) {
+        // On failure, remove from pending so they can be retried
+        for (const item of toFetch) {
+            _pendingEnrich.delete(getTrackKey(item.name, item.artist));
+        }
+    }
+}
+
+/**
+ * Queue a track for enrichment (debounced batch flush).
+ * This is the replacement for the old loadTrackEnrichment()+setTimeout waterfall.
+ */
+function queueTrackEnrichment(trackName, artistName, row, trackObj) {
+    if (!trackName || !artistName) return;
+    if (trackObj) seedEnrichCache(trackObj);
+    const key = getTrackKey(trackName, artistName);
+    if (enrichCache[key]) {
+        // Already cached — apply immediately
+        _applyEnrichmentToDOM(key, enrichCache[key], trackName, artistName, row);
+        return;
+    }
+    if (_pendingEnrich.has(key)) return; // already in-flight
+    _enrichQueue.push({ name: trackName, artist: artistName, row: row || -1 });
+    // Debounce: collect for 30ms then flush as one batch
+    clearTimeout(_enrichFlushTimer);
+    _enrichFlushTimer = setTimeout(_flushEnrichQueue, 30);
+}
+
+/**
+ * Legacy compatibility shim — redirect to queue system.
+ * @deprecated Use queueTrackEnrichment() for new code.
+ */
+async function loadTrackEnrichment(trackName, artistName, containerId, row, trackObj) {
+    queueTrackEnrichment(trackName, artistName, row, trackObj);
 }
 
 function handlePreviewClick(btn) {
@@ -1514,7 +1623,7 @@ function renderPlaylistView(data) {
             </div>
             <button class="btn-secondary" onclick="event.stopPropagation();selectDropdownItem('${escapeJs(t.name)}', '${escapeJs(t.artist)}')" style="padding:6px 14px;font-size:12px;border-radius:500px;">Explore</button>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `art-plv-${t.row || i}`, t.row || 0, t), i * 40);
+        queueTrackEnrichment(t.name, t.artist, t.row || 0, t);
     });
     html += `</div>`;
     listEl.innerHTML = html;
@@ -1735,7 +1844,7 @@ function renderArtistTracks(tracks) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-a-${t.row}`, t.row, t), idx * 15);
+        queueTrackEnrichment(t.name, t.artist, t.row, t);
     });
 
     document.getElementById('artistTracksList').innerHTML = html;
@@ -1777,7 +1886,7 @@ function renderArtistAlbums(albums) {
         </div>`;
 
         if (firstTrack) {
-            setTimeout(() => loadTrackEnrichment(firstTrack.name, firstTrack.artist, `art-album-${idx}`, firstTrack.row, firstTrack), idx * 60);
+            queueTrackEnrichment(firstTrack.name, firstTrack.artist, firstTrack.row, firstTrack);
         }
     });
     html += `</div>`;
@@ -1848,7 +1957,7 @@ function renderExpandedAlbum(albums, idx) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-ex-${t.row}`, t.row, t), tidx * 60);
+        queueTrackEnrichment(t.name, t.artist, t.row, t);
     });
     html += `</div>`;
     document.getElementById('artistTracksList').innerHTML = html;
@@ -1933,7 +2042,7 @@ function renderAlbumTrackList(tracks, albumTitle) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-alb-${idx}`, t.row, t), idx * 40);
+        queueTrackEnrichment(t.name, t.artist, t.row, t);
     });
 
     document.getElementById('albumTracksList').innerHTML = html;
@@ -2027,7 +2136,12 @@ async function sendFeedback(row, signal, btnElem, extraName, extraArtist) {
 // ---------------------------------------------------------
 // Profile Stats & My Songs
 // ---------------------------------------------------------
-async function refreshProfileStats() {
+// Debounce: at most one profile refresh per 3 seconds
+let _profileRefreshTimer = null;
+let _profileRefreshPending = false;
+
+async function _doRefreshProfileStats() {
+    _profileRefreshPending = false;
     try {
         const res = await fetch(`${API_BASE}/api/profile?user=${encodeURIComponent(currentUser)}`);
         const data = await res.json();
@@ -2050,6 +2164,15 @@ async function refreshProfileStats() {
         document.getElementById('topGenresList').innerText = data.top_genres.length ? data.top_genres.map(g => g[0]).join(', ') : 'None yet';
         document.getElementById('topArtistsList').innerText = data.top_artists.length ? data.top_artists.map(a => a[0]).join(', ') : 'None yet';
     } catch (err) { console.error(err); }
+}
+
+async function refreshProfileStats() {
+    // Debounce: coalesce rapid calls (e.g. multiple likes in quick succession)
+    // into at most one network request per 3 seconds.
+    if (_profileRefreshPending) return;
+    _profileRefreshPending = true;
+    clearTimeout(_profileRefreshTimer);
+    _profileRefreshTimer = setTimeout(_doRefreshProfileStats, 3000);
 }
 
 async function loadMySongs() {
@@ -2100,7 +2223,7 @@ function filterMySongs(filterType, btnElem) {
                 <button class="btn-act explore" onclick="event.stopPropagation();selectDropdownItem('${t.name.replace(/'/g, "\\'")}', '${t.artist.replace(/'/g, "\\'")}')">${SVG_ICONS.explore} Explore</button>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-h-${t.row}`, t.row, t), idx * 60);
+        queueTrackEnrichment(t.name, t.artist, t.row, t);
     });
     html += '</div>';
     container.innerHTML = html;
@@ -2160,7 +2283,14 @@ window.onload = () => {
     loadUsers();
     refreshProfileStats();
     loadHomePage();
-    
-    // Periodically bind horizontal scroll handlers to newly rendered carousels
-    setInterval(enableAllHorizontalScrolls, 500);
+
+    // Use MutationObserver instead of setInterval polling to bind scroll handlers.
+    // This fires only when DOM actually changes, saving ~500ms CPU cycles/second.
+    const _scrollObserver = new MutationObserver(() => {
+        enableAllHorizontalScrolls();
+    });
+    const _mainContent = document.querySelector('.main-content') || document.body;
+    _scrollObserver.observe(_mainContent, { childList: true, subtree: true });
+    // Run once on load in case elements already exist
+    enableAllHorizontalScrolls();
 };
