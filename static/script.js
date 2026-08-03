@@ -169,7 +169,7 @@ function openMobileInsights() {
     const artistNameEl = document.getElementById('playerArtistName');
     
     if (currentPlayingRow !== null && trackNameEl && trackNameEl.innerText && trackNameEl.innerText !== 'Audio Preview') {
-        openTrackIntel(currentPlayingRow, trackNameEl.innerText, artistNameEl ? artistNameEl.innerText : '');
+        selectTrackForInsights(currentPlayingRow, trackNameEl.innerText, artistNameEl ? artistNameEl.innerText : '', null);
         return;
     }
 
