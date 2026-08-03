@@ -373,9 +373,10 @@ searchInput.addEventListener('input', (e) => {
     if (currentSearchType === 'nlp') return;
     const q = e.target.value.trim();
     clearTimeout(searchTimeout);
-    if (q.length < 2) { hideSuggestions(); return; }
+    if (q.length < 3) { hideSuggestions(); return; }
 
     searchTimeout = setTimeout(async () => {
+
         try {
             const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(q)}`);
             if (!res.ok) return hideSuggestions();
@@ -623,6 +624,7 @@ function renderHomePage(data) {
     // Recommendation Sections
     if (data.sections && data.sections.length > 0) {
         data.sections.forEach(section => {
+            if (section.tracks) section.tracks.forEach(seedEnrichCache);
             html += renderHomeSection(section);
         });
     }
@@ -668,7 +670,7 @@ function renderHomeSection(section) {
                 </div>
                 <div class="listen-on-row" id="enrich-hs-${t.row}" data-track-key="${escapeAttr(getTrackKey(t.name, t.artist))}"></div>
             </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-hs-${t.row}`, t.row), idx * 60);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-hs-${t.row}`, t.row, t), idx * 60);
     });
 
     html += `</div></div>`;
@@ -782,7 +784,11 @@ async function executeSearch(query, forcedType = null, seedTrack = null) {
 }
 
 function renderMainData(data) {
+    if (data && data.recs) {
+        data.recs.forEach(seedEnrichCache);
+    }
     const audioPanel = document.getElementById('audioVectorPanel');
+
     if (audioPanel) audioPanel.classList.remove('hidden');
 
     // Audio Feature Meters (animated)
@@ -830,7 +836,7 @@ function renderMainData(data) {
     html += `<div id="trackCardsContainer">`;
     data.recs.forEach((r, idx) => {
         const sigs = r.signals || {};
-        const activeSig = userTrackSignals[r.row] || '';
+        const activeSig = (r.row >= 0 ? userTrackSignals[r.row] : null) || userTrackSignals[getTrackKey(r.name, r.artist)] || '';
         html += `
         <div class="track-card" id="card-${r.row}" onclick="selectTrackForInsights(${r.row}, '${escapeJs(r.name)}', '${escapeJs(r.artist)}', this)">
             <div class="track-info-side">
@@ -856,7 +862,7 @@ function renderMainData(data) {
             </div>
         </div>`;
         // Lazy-load enrichment for each rec card
-        setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row), idx * 80);
+        setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row, r), idx * 80);
     });
     html += `</div>`;
     
@@ -896,7 +902,7 @@ async function loadMoreRecommendations() {
             data.recs.forEach((r, idx) => {
                 const globalIdx = currentOffset + idx;
                 const sigs = r.signals || {};
-                const activeSig = userTrackSignals[r.row] || '';
+                const activeSig = (r.row >= 0 ? userTrackSignals[r.row] : null) || userTrackSignals[getTrackKey(r.name, r.artist)] || '';
                 appendHtml += `
                 <div class="track-card" id="card-${r.row}" onclick="selectTrackForInsights(${r.row}, '${escapeJs(r.name)}', '${escapeJs(r.artist)}', this)">
                     <div class="track-info-side">
@@ -921,7 +927,7 @@ async function loadMoreRecommendations() {
                         </div>
                     </div>
                 </div>`;
-                setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row), idx * 80);
+                setTimeout(() => loadTrackEnrichment(r.name, r.artist, `enrich-${r.row}`, r.row, r), idx * 80);
             });
             container.insertAdjacentHTML('beforeend', appendHtml);
         }
@@ -1129,8 +1135,26 @@ function openMobileTrackInsights(trackName, artistName, data, row) {
 // ---------------------------------------------------------
 const enrichCache = {};
 
-async function loadTrackEnrichment(trackName, artistName, containerId, row) {
+function seedEnrichCache(track) {
+    if (!track || !track.name || !track.artist) return;
+    if (track.deezer_album_art || track.deezer_preview_url || track.deezer_link || track.youtube_music_url) {
+        const cacheKey = getTrackKey(track.name, track.artist);
+        if (!enrichCache[cacheKey]) {
+            enrichCache[cacheKey] = {
+                deezer_album_art: track.deezer_album_art || "",
+                deezer_preview_url: track.deezer_preview_url || "",
+                deezer_link: track.deezer_link || "",
+                deezer_album_name: track.deezer_album_name || "",
+                youtube_music_url: track.youtube_music_url || `https://music.youtube.com/search?q=${encodeURIComponent(track.artist + ' ' + track.name)}`,
+                youtube_url: track.youtube_url || `https://www.youtube.com/results?search_query=${encodeURIComponent(track.artist + ' ' + track.name)}`
+            };
+        }
+    }
+}
+
+async function loadTrackEnrichment(trackName, artistName, containerId, row, trackObj) {
     if (!trackName || !artistName) return;
+    if (trackObj) seedEnrichCache(trackObj);
     const cacheKey = getTrackKey(trackName, artistName);
     let data = enrichCache[cacheKey];
     if (!data) {
@@ -1140,6 +1164,7 @@ async function loadTrackEnrichment(trackName, artistName, containerId, row) {
             enrichCache[cacheKey] = data;
         } catch (e) { return; }
     }
+
 
     let btns = '';
     if (data.deezer_link) {
@@ -1463,6 +1488,9 @@ function closePlaylistModal() {
 }
 
 function renderPlaylistView(data) {
+    if (data && data.tracks) {
+        data.tracks.forEach(seedEnrichCache);
+    }
     const titleEl = document.getElementById('playlistTitle');
     const metaEl = document.getElementById('playlistMeta');
     const listEl = document.getElementById('playlistViewTracksList');
@@ -1486,7 +1514,7 @@ function renderPlaylistView(data) {
             </div>
             <button class="btn-secondary" onclick="event.stopPropagation();selectDropdownItem('${escapeJs(t.name)}', '${escapeJs(t.artist)}')" style="padding:6px 14px;font-size:12px;border-radius:500px;">Explore</button>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `art-plv-${t.row || i}`, t.row || 0), i * 40);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `art-plv-${t.row || i}`, t.row || 0, t), i * 40);
     });
     html += `</div>`;
     listEl.innerHTML = html;
@@ -1580,17 +1608,28 @@ async function loadArtistHeaderPhoto(artistName) {
     } catch (e) { }
 }
 
+const artistImageCache = {};
+
 async function loadArtistCircleAvatar(artistName, elementId) {
     const el = document.getElementById(elementId);
-    if (!el) return;
+    if (!el || !artistName) return;
+    const key = artistName.toLowerCase().trim();
+    if (artistImageCache[key] !== undefined) {
+        if (artistImageCache[key]) {
+            el.innerHTML = `<img src="${artistImageCache[key]}" alt="${artistName}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+        }
+        return;
+    }
     try {
         const res = await fetch(`${API_BASE}/api/artist_image?q=${encodeURIComponent(artistName)}`);
         const data = await res.json();
-        if (data && data.image_url) {
-            el.innerHTML = `<img src="${data.image_url}" alt="${artistName}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+        artistImageCache[key] = (data && data.image_url) ? data.image_url : "";
+        if (artistImageCache[key]) {
+            el.innerHTML = `<img src="${artistImageCache[key]}" alt="${artistName}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
         }
-    } catch (e) { }
+    } catch (e) { artistImageCache[key] = ""; }
 }
+
 
 function renderLastfmArtistInfo(lfm, artistName) {
     let existing = document.getElementById('lastfmArtistPanel');
@@ -1672,7 +1711,7 @@ function renderArtistTracks(tracks) {
     let html = '';
     tracks.forEach((t, idx) => {
         const genres = (t.base_genres || t.genres || []).slice(0, 2);
-        const activeSig = userTrackSignals[t.row] || '';
+        const activeSig = (t.row >= 0 ? userTrackSignals[t.row] : null) || userTrackSignals[getTrackKey(t.name, t.artist)] || '';
         html += `
         <div class="track-card" id="card-a-${t.row}" onclick="selectTrackForInsights(${t.row}, '${escapeJs(t.name)}', '${escapeJs(t.artist)}', this)">
             <div class="track-info-side">
@@ -1696,7 +1735,7 @@ function renderArtistTracks(tracks) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-a-${t.row}`, t.row), idx * 15);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-a-${t.row}`, t.row, t), idx * 15);
     });
 
     document.getElementById('artistTracksList').innerHTML = html;
@@ -1738,7 +1777,7 @@ function renderArtistAlbums(albums) {
         </div>`;
 
         if (firstTrack) {
-            setTimeout(() => loadTrackEnrichment(firstTrack.name, firstTrack.artist, `art-album-${idx}`, firstTrack.row), idx * 60);
+            setTimeout(() => loadTrackEnrichment(firstTrack.name, firstTrack.artist, `art-album-${idx}`, firstTrack.row, firstTrack), idx * 60);
         }
     });
     html += `</div>`;
@@ -1786,7 +1825,7 @@ function renderExpandedAlbum(albums, idx) {
     album.tracks.forEach((t, tidx) => {
         const trackKey = getTrackKey(t.name, t.artist);
         const genres = (t.base_genres || t.genres || []).slice(0, 2);
-        const activeSig = userTrackSignals[t.row] || '';
+        const activeSig = (t.row >= 0 ? userTrackSignals[t.row] : null) || userTrackSignals[getTrackKey(t.name, t.artist)] || '';
         html += `
         <div class="track-card" id="card-ex-${t.row}" onclick="selectTrackForInsights(${t.row}, '${escapeJs(t.name)}', '${escapeJs(t.artist)}', this)">
             <div class="track-info-side">
@@ -1809,7 +1848,7 @@ function renderExpandedAlbum(albums, idx) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-ex-${t.row}`, t.row), tidx * 60);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-ex-${t.row}`, t.row, t), tidx * 60);
     });
     html += `</div>`;
     document.getElementById('artistTracksList').innerHTML = html;
@@ -1848,6 +1887,10 @@ async function openAlbumPage(albumTitle, artistName = '', albumId = '', source =
             document.getElementById('albumArtBox').innerHTML = `<img src="${data.tracks[0].deezer_album_art}" alt="${albumTitle}" style="width:100%;height:100%;object-fit:cover;border-radius:12px;">`;
         }
 
+        if (data.tracks) {
+            data.tracks.forEach(seedEnrichCache);
+        }
+
         renderAlbumTrackList(data.tracks, albumTitle);
     } catch (err) {
         document.getElementById('albumTracksList').innerHTML = `<div class="loading-state">Could not load album tracks.</div>`;
@@ -1864,7 +1907,7 @@ function renderAlbumTrackList(tracks, albumTitle) {
     tracks.forEach((t, idx) => {
         const trackKey = getTrackKey(t.name, t.artist);
         const genres = (t.base_genres || t.genres || []).slice(0, 2);
-        const activeSig = userTrackSignals[t.row] || '';
+        const activeSig = (t.row >= 0 ? userTrackSignals[t.row] : null) || userTrackSignals[getTrackKey(t.name, t.artist)] || '';
         const artHtml = t.deezer_album_art ? `<img src="${t.deezer_album_art}" style="width:100%;height:100%;object-fit:cover;border-radius:8px;">` : '🎵';
 
         html += `
@@ -1890,7 +1933,7 @@ function renderAlbumTrackList(tracks, albumTitle) {
                 </div>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-alb-${idx}`, t.row), idx * 40);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-alb-${idx}`, t.row, t), idx * 40);
     });
 
     document.getElementById('albumTracksList').innerHTML = html;
@@ -1901,8 +1944,35 @@ function renderAlbumTrackList(tracks, albumTitle) {
 // ---------------------------------------------------------
 let userTrackSignals = {};
 
-async function sendFeedback(row, signal, btnElem) {
-    userTrackSignals[row] = signal;
+async function sendFeedback(row, signal, btnElem, extraName, extraArtist) {
+    let name = extraName || "";
+    let artist = extraArtist || "";
+    let deezer_album_art = "";
+    let deezer_preview_url = "";
+
+    if (btnElem) {
+        const card = btnElem.closest('.track-card') || btnElem.closest('.home-track-card');
+        if (card) {
+            const nameEl = card.querySelector('.track-name') || card.querySelector('.home-card-name');
+            const artistEl = card.querySelector('.track-artist') || card.querySelector('.home-card-artist');
+            const imgEl = card.querySelector('.cover-art-box img') || card.querySelector('.home-card-art img');
+            if (nameEl && !name) name = nameEl.innerText.replace(/^\d+\.\s*/, '').trim();
+            if (artistEl && !artist) artist = artistEl.innerText.split('·')[0].trim();
+            if (imgEl) deezer_album_art = imgEl.src || "";
+        }
+    }
+
+    const trackKey = (name && artist) ? getTrackKey(name, artist) : "";
+    const rKey = (row !== undefined && row !== null && row >= 0) ? row : (trackKey || `ext_${name}_${artist}`);
+
+    // YouTube-style toggle logic: clicking an active button toggles it OFF ('none')
+    let activeSignal = signal;
+    if (userTrackSignals[rKey] === signal || (trackKey && userTrackSignals[trackKey] === signal)) {
+        activeSignal = "none";
+    }
+
+    userTrackSignals[rKey] = activeSignal;
+    if (trackKey) userTrackSignals[trackKey] = activeSignal;
 
     if (btnElem) {
         btnElem.classList.add('anim-pulse');
@@ -1911,19 +1981,44 @@ async function sendFeedback(row, signal, btnElem) {
         const parent = btnElem.parentElement;
         if (parent) {
             parent.querySelectorAll('.btn-act').forEach(b => {
-                b.classList.remove('active-like', 'active-dislike', 'active-skip');
+                b.classList.remove('active-like', 'active-dislike');
             });
-            if (signal === 'like') btnElem.classList.add('active-like');
-            if (signal === 'dislike') btnElem.classList.add('active-dislike');
-            if (signal === 'skip') btnElem.classList.add('active-skip');
+            if (activeSignal === 'like') btnElem.classList.add('active-like');
+            if (activeSignal === 'dislike') btnElem.classList.add('active-dislike');
         }
+    }
+
+    if (name && artist) {
+        const cacheKey = getTrackKey(name, artist);
+        const cached = enrichCache[cacheKey];
+        if (cached) {
+            if (cached.deezer_album_art) deezer_album_art = cached.deezer_album_art;
+            if (cached.deezer_preview_url) deezer_preview_url = cached.deezer_preview_url;
+        }
+    }
+
+    if (activeSignal === 'none') {
+        showToast(signal === 'like' ? 'Removed from Liked Songs' : 'Dislike removed');
+    } else if (activeSignal === 'like') {
+        showToast(`Added "${name || 'song'}" to Liked Songs`, 'success');
+    } else if (activeSignal === 'dislike') {
+        showToast(`Marked "${name || 'song'}" as Disliked`, 'info');
     }
 
     try {
         await fetch(`${API_BASE}/api/feedback`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user: currentUser, row, signal, mode: currentMode })
+            body: JSON.stringify({
+                user: currentUser,
+                row: (row !== undefined && row !== null) ? row : -1,
+                signal: activeSignal,
+                mode: currentMode,
+                name: name || undefined,
+                artist: artist || undefined,
+                deezer_album_art: deezer_album_art || undefined,
+                deezer_preview_url: deezer_preview_url || undefined
+            })
         });
         refreshProfileStats();
     } catch (err) { console.error(err); }
@@ -1937,6 +2032,19 @@ async function refreshProfileStats() {
         const res = await fetch(`${API_BASE}/api/profile?user=${encodeURIComponent(currentUser)}`);
         const data = await res.json();
         profileDataCache = data.history || [];
+
+        // Pre-fill userTrackSignals map from profile active history
+        (data.history || []).forEach(ev => {
+            if (ev.signal) {
+                if (ev.row !== undefined && ev.row !== null && ev.row >= 0) {
+                    userTrackSignals[ev.row] = ev.signal;
+                }
+                if (ev.name && ev.artist) {
+                    const tk = getTrackKey(ev.name, ev.artist);
+                    userTrackSignals[tk] = ev.signal;
+                }
+            }
+        });
 
         document.getElementById('profileCardUser').innerText = currentUser;
         document.getElementById('topGenresList').innerText = data.top_genres.length ? data.top_genres.map(g => g[0]).join(', ') : 'None yet';
@@ -1958,7 +2066,6 @@ function filterMySongs(filterType, btnElem) {
     let filtered = profileDataCache;
     if (filterType === 'like') filtered = profileDataCache.filter(t => t.signal === 'like');
     if (filterType === 'dislike') filtered = profileDataCache.filter(t => t.signal === 'dislike');
-    if (filterType === 'skip') filtered = profileDataCache.filter(t => t.signal === 'skip');
 
     const container = document.getElementById('mySongsList');
     if (!container) return;
@@ -1970,14 +2077,16 @@ function filterMySongs(filterType, btnElem) {
 
     let html = '<div class="my-songs-grid">';
     filtered.forEach((t, idx) => {
-        const signalLabel = t.signal === 'like' ? 'Liked' : t.signal === 'dislike' ? 'Disliked' : 'Skipped';
-        const signalClass = t.signal === 'like' ? 'signal-like' : t.signal === 'dislike' ? 'signal-dislike' : 'signal-skip';
-        const signalIcon = t.signal === 'like' ? SVG_ICONS.like : t.signal === 'dislike' ? SVG_ICONS.dislike : SVG_ICONS.skip;
+        const signalLabel = t.signal === 'like' ? 'Liked' : 'Disliked';
+        const signalClass = t.signal === 'like' ? 'signal-like' : 'signal-dislike';
+        const signalIcon = t.signal === 'like' ? SVG_ICONS.like : SVG_ICONS.dislike;
+
+        const artHtml = t.deezer_album_art ? `<img src="${t.deezer_album_art}" style="width:100%;height:100%;object-fit:cover;border-radius:8px;">` : '🎵';
 
         html += `
         <div class="track-card my-song-card" id="card-h-${t.row}" onclick="selectTrackForInsights(${t.row}, '${escapeJs(t.name)}', '${escapeJs(t.artist)}', this)">
             <div class="track-info-side">
-                <div class="cover-art-box enrich-art" id="art-h-${t.row}" data-track-key="${escapeAttr(getTrackKey(t.name, t.artist))}">🎵</div>
+                <div class="cover-art-box enrich-art" id="art-h-${t.row}" data-track-key="${escapeAttr(getTrackKey(t.name, t.artist))}">${artHtml}</div>
                 <div class="track-details">
                     <div class="track-name">${t.name}</div>
                     <div class="track-artist" onclick="event.stopPropagation();openArtistPage('${escapeJs(t.artist)}')">${t.artist} ${t.year ? `· <span style="color:var(--text-dim);">${t.year}</span>` : ''}</div>
@@ -1991,7 +2100,7 @@ function filterMySongs(filterType, btnElem) {
                 <button class="btn-act explore" onclick="event.stopPropagation();selectDropdownItem('${t.name.replace(/'/g, "\\'")}', '${t.artist.replace(/'/g, "\\'")}')">${SVG_ICONS.explore} Explore</button>
             </div>
         </div>`;
-        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-h-${t.row}`, t.row), idx * 60);
+        setTimeout(() => loadTrackEnrichment(t.name, t.artist, `enrich-h-${t.row}`, t.row, t), idx * 60);
     });
     html += '</div>';
     container.innerHTML = html;
